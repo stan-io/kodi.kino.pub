@@ -7,9 +7,11 @@ import xbmcplugin
 import xbmcgui
 import xbmc
 import xbmcaddon
+import xbmcvfs
 import json
 import addonutils
 import time
+import re
 
 __id__ = 'video.kino.pub'
 __addon__ = xbmcaddon.Addon(id=__id__)
@@ -91,6 +93,59 @@ def show_pagination(pagination, action, qp):
     xbmcplugin.endOfDirectory(handle)
 
 
+# Write nfo file about item
+def generate_nfo(path, title, item):
+    import xml.etree.ElementTree as ET
+    xbmcvfs.mkdirs(path)
+    f = xbmcvfs.File('%s/%s.nfo' % (path, title), 'w')
+    root = None
+    if item['type'] in ['serial', 'docuserial', 'tvshow']:
+        root = ET.Element('tvshow')
+    else:
+        root = ET.Element('movie')
+    ET.SubElement(root, 'title').text = item['title']
+    ET.SubElement(root, 'originaltitle').text = item['title'].split(' / ')[-1]
+    ET.SubElement(root, 'sorttitle').text = item['title'].split(' / ')[-1]
+    ET.SubElement(root, 'year').text = str(item['year'])
+    ET.SubElement(root, 'thumb').text = item['posters']['big']
+    if item['imdb_rating']:
+        ET.SubElement(root, 'rating').text = str(item['imdb_rating'])
+    elif item['kinopoisk_rating']:
+        ET.SubElement(root, 'rating').text = str(item['kinopoisk_rating'])
+    else:
+        ET.SubElement(root, 'rating').text = str(float(item['rating_percentage'])/10)
+    ET.SubElement(root, 'plot').text = item['plot']
+    for genre in item['genres']:
+        ET.SubElement(root, 'genre').text = genre['title']
+    for cast in item['cast'].split(','):
+        actor = ET.SubElement(root, 'actor')
+        ET.SubElement(actor, 'name').text = cast.strip(' ')
+    for director in item['director'].split(','):
+        ET.SubElement(root, 'director').text = director.strip(' ')
+    trailer = trailer_link(item)
+    if trailer:
+        ET.SubElement(root, 'trailer').text = trailer
+    if item['imdb']:
+        ET.SubElement(root, 'id').text = 'tt%s' % item['imdb']
+    if 'videos' in item and len(item['videos']) > 0:
+        ET.SubElement(root, 'set').text = item['title']
+    if item['duration']: # in minutes
+        ET.SubElement(root, 'runtime').text = str(int(item['duration']['average']) / 60)
+    f.write(ET.tostring(root, encoding='utf8', method='xml'))
+
+def generate_episode_nfo(path, title, episode, season_num, episode_num):
+    import xml.etree.ElementTree as ET
+    xbmcvfs.mkdirs(path)
+    f = xbmcvfs.File('%s/%s.nfo' % (path, title), 'w')
+    root = ET.Element('episodedetails')
+    episode_title = "s%02de%02d" % (season_num, episode_num)
+    ET.SubElement(root, 'title').text = episode['title'] if episode['title'] else episode_title
+    ET.SubElement(root, 'season').text = str(season_num)
+    ET.SubElement(root, 'episode').text = str(episode_num)
+    ET.SubElement(root, 'thumb').text = episode['thumbnail']
+    f.write(ET.tostring(root, encoding='utf8', method='xml'))
+
+
 # Get trailer link
 def trailer_link(item):
     if 'trailer' in item and item['trailer']:
@@ -111,6 +166,8 @@ def show_items(items, options={}):
             li.setLabel("%s. %s" % (index+1, li.getLabel()))
         li.setInfo('Video', addonutils.video_info(item, {'trailer': trailer_link(item)}))
         li.setArt({'poster': item['posters']['big']})
+        import_url = get_internal_link('import', {'id': item['id']})
+        li.addContextMenuItems([('Добавить в библиотеку', 'XBMC.RunPlugin(%s)' % import_url,),])
         # If not serials or multiseries movie, create playable item
         if item['type'] not in ['serial', 'docuserial', 'tvshow']:
             if item['subtype'] == '':
@@ -329,6 +386,66 @@ def actionItems(qp):
     else:
         notice(response['message'], response['name'])
 
+def actionImport(qp):
+    response = api('items/%s' % qp['id'])
+    folder_path = None
+    if response['status'] == 200:
+        # show settings if folders are not set
+        if not xbmcvfs.exists(__settings__.getSetting('movies_folder')) or not xbmcvfs.exists(__settings__.getSetting('tvshows_folder')):
+            __addon__.openSettings()
+
+        item = response['item']
+        title = item['title']
+        # cleanup title
+        title = re.sub(ur'[^\w\s-]', '', title.split(' / ')[-1], flags=re.UNICODE).strip().lower()
+        title = re.sub(ur'[-\s]+', '-', title, flags=re.UNICODE)
+        title = '%s-(%s)' % (title.encode('utf-8'), str(item['year']))
+
+        # import a movie
+        if item['type'] not in ['serial', 'docuserial', 'tvshow']:
+            folder_path = __settings__.getSetting('movies_folder')
+            if not xbmcvfs.exists(folder_path):
+                notice('Путь к библиотеке фильмов не существует', 'Ошибка')
+                return
+            if item['subtype'] == 'multi' and 'videos' in item and len(item['videos']) > 1:
+                folder_path = '%s/%s' % (folder_path, title)
+                xbmcvfs.mkdirs(folder_path)
+                generate_nfo(folder_path, title, item)
+                for video_number, video in enumerate(item['videos']):
+                    video_number += 1
+                    episode_title = "%s.%02d" % (title, video_number)
+                    f = xbmcvfs.File('%s/%s.strm' % (folder_path, episode_title), 'w')
+                    f.write(get_internal_link('play', {'id': qp['id'], 'video': video_number}))
+            else:
+                generate_nfo(folder_path, title, item)
+                f = xbmcvfs.File('%s/%s.strm' % (folder_path, title), 'w')
+                f.write(get_internal_link('play', {'id': qp['id'], 'video': 1}))
+        # import a show
+        else:
+            season_to_import = int(qp['season']) if 'season' in qp else None
+            episode_to_import = int(qp['episode']) if 'episode' in qp else None
+            folder_path = __settings__.getSetting('tvshows_folder')
+            if not xbmcvfs.exists(folder_path):
+                notice('Путь к библиотеке сериалов не существует', 'Ошибка')
+                return
+            folder_path = '%s/%s' % (folder_path, title)
+            generate_nfo(folder_path, title, item)
+            for season in item['seasons']:
+                if season_to_import is None or int(season['number']) == int(qp['season']):
+                    for episode_number, episode in enumerate(season['episodes']):
+                        episode_number += 1
+                        if episode_to_import is None or episode_number == episode_to_import:
+                            episode_path = '%s/s%02d' % (folder_path, season['number'])
+                            episode_title = "%s_s%02de%02d" % (title, season['number'], episode_number)
+                            xbmcvfs.mkdirs(episode_path)
+                            generate_episode_nfo(episode_path, episode_title, episode, season['number'], episode_number)
+                            f = xbmcvfs.File('%s/%s.strm' % (episode_path, episode_title), 'w')
+                            f.write(get_internal_link('play', {'id': qp['id'], 'season': season['number'], 'episode': episode_number}))
+
+        xbmc.executebuiltin('XBMC.UpdateLibrary(video)')
+        notice('Добавлено успешно', 'KinoPub', 1000)
+
+
 # Show items
 # If item type is movie with more than 1 episodes - show those episodes
 # If item type is serial, docuserial, tvshow - show seasons
@@ -362,6 +479,8 @@ def actionView(qp):
                             li.setInfo('Video', {'playcount': int(episode['watched'])})
                             li.setArt({'poster': item['posters']['big']})
                             li.setProperty('IsPlayable', 'true')
+                            import_url = get_internal_link('import', {'id': item['id'], 'season': season['number'], 'episode': episode_number})
+                            li.addContextMenuItems([('Добавить в библиотеку', 'XBMC.RunPlugin(%s)' % import_url,),])
                             if watching_season['episodes'][episode_number-1]['status'] < 1 and not selectedEpisode:
                                 selectedEpisode = True
                                 li.select(selectedEpisode)
@@ -381,6 +500,8 @@ def actionView(qp):
                         'season': int(season['number']),
                     }))
                     li.setArt({'poster': item['posters']['big']})
+                    import_url = get_internal_link('import', {'id': item['id'], 'season': season['number']})
+                    li.addContextMenuItems([('Добавить в библиотеку', 'XBMC.RunPlugin(%s)' % import_url,),])
                     if watching_season['status'] < 1 and not selectedSeason:
                         selectedSeason = True
                         li.select(selectedSeason)
@@ -427,11 +548,11 @@ def actionPlay(qp):
                         episode_title = "s%02de%02d" % (season['number'], episode_number)
                         episode_title = "%s | %s" % (episode_title, episode['title']) if episode['title'] else episode_title
                         liObject = xbmcgui.ListItem(episode_title)
-                        liObject.setInfo("video", {
+                        liObject.setInfo("video", addonutils.video_info(item, {
                             'season': season['number'],
                             'episode': episode_number,
                             'duration': videoObject['duration'] if 'duration' in videoObject else None
-                        })
+                        }))
         elif 'video' in qp:
             # process video
             for video_number, video in enumerate(item['videos']):
@@ -442,12 +563,13 @@ def actionPlay(qp):
                         episode_title = "e%02d" % (video_number)
                         episode_title = "%s | %s" % (episode_title, video['title']) if video['title'] else episode_title
                         liObject = xbmcgui.ListItem(episode_title)
-                        liObject.setInfo("video", {
+                        liObject.setInfo("video", addonutils.video_info(item, {
                             'season': 1,
                             'episode': video_number
-                        })
+                        }))
                     else:
                         liObject = xbmcgui.ListItem(item['title'])
+                        liObject.setInfo('video', addonutils.video_info(item))
         else:
             pass
 
@@ -459,6 +581,9 @@ def actionPlay(qp):
         if len(subtitles) > 0:
             liObject.setSubtitles(subtitles)
 
+        liObject.setThumbnailImage(item['posters']['big'])
+        liObject.setArt({'poster': item['posters']['small']})
+
         if 'files' not in videoObject:
             notice("Видео обновляется и временно не доступно!", "Видео в обработке", time=8000)
             return
@@ -466,6 +591,7 @@ def actionPlay(qp):
         api("watching/marktime", {'id': qp['id'], 'video': videoObject['number'], 'time': videoObject['duration'], 'season': season_number})
         liObject.setPath(url)
         xbmcplugin.setResolvedUrl(handle, True, liObject)
+
 
 def actionTrailer(qp):
     response = api('items/trailer', params={'id': qp['id']})

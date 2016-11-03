@@ -4,6 +4,8 @@
 	<setting id="stream_type" type="select" label="Тип стриминга" values="hls|http|hls4" default="hls"/>
 	<setting type="sep" />
 	<setting id="reset_auth" type="enum" label="Сбросить авторизацию" values="Нет|Да" default="Нет"/>
+	<setting id="movies_folder" type="folder" label="Путь к Фильмам" source="video" option="writeable" />
+	<setting id="tvshows_folder" type="folder" label="Путь к Сериалам" source="video" option="writeable" />
     <!--
 	<setting id="logout" type="action" label="Очистить данные и выйти" action="RunPlugin(plugin://plugin.video.megogo.net/?func=logout)" />
 	<setting type="sep" />
